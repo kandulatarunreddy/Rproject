@@ -1,68 +1,80 @@
 library(shiny)
 library(ggplot2)
 library(plotly)
-library(tidyverse)
-library(lubridate)
-library(scales)
+library(dplyr)
+library(fredr)
+library(caret)
+library(tidyr)
 
-# Define UI
+fredr_set_key('f31374c525421a4b2158ade45fea6a85')
+
+data <- fredr(series_id = "T10YFF", observation_start = as.Date("1962-01-02"), observation_end = as.Date("2023-03-31"), frequency = "m")
+
+# Get the NBER recession indicator data
+nber_data <- fredr(series_id = "USREC", observation_start = as.Date("1962-01-02"), observation_end = as.Date("2023-03-31"))
+
+# Merge the yield curve and NBER recession indicator data
+merged_data <- merge(data, nber_data, by = "date")
+names(merged_data)[3] <- "yield_curve"
+names(merged_data)[7] <- "nber_rec"
+
 ui <- fluidPage(
   titlePanel("HAWK RECESSION INDEX"),
   sidebarLayout(
     sidebarPanel(
-      fileInput("file", "Choose CSV file",
-                accept = c("text/csv",
-                           "text/comma-separated-values,text/plain",
-                           ".csv")),
-      checkboxInput("header", "Header", TRUE),
-      selectInput("xvar", "X-Axis",
-                  choices = c("Month")),
-      selectInput("yvar", "Y-Axis",
-                  choices = c("Recession")),
-      
-      #OPTION: Date Range
-      dateRangeInput("date_range", 
-                     "Date range:", 
-                     start = "2000-01-01", 
-                     end = "2020-04-01") # Add date range slide
+      dateRangeInput("date_range", label = "Date range", start = min(merged_data$date), end = max(merged_data$date), min = min(merged_data$date), max = max(merged_data$date))
     ),
     mainPanel(
-      plotOutput("lineplot")
+      plotlyOutput("line_plot"),
+      verbatimTextOutput("accuracy")
     )
   )
 )
 
-# Define server
 server <- function(input, output) {
   
-  # Read CSV file
-  data <- reactive({
-    req(input$file)
-    df <- read.csv(input$file$datapath, header = input$header)
-    df[[input$xvar]] <- ymd(df[[input$xvar]]) # Convert x-axis variable to Date type
-    df
-  })
-  
-  # Filter data by date range
+  # Create a reactive expression for the date range and the probit values
   filtered_data <- reactive({
-    df <- data()
-    df <- df[df[[input$xvar]] >= input$date_range[1] & df[[input$xvar]] <= input$date_range[2],]
+    data <- merged_data %>%
+      mutate(probit_values = fitted(glm(nber_rec ~ yield_curve, data = ., family = binomial(link = "probit")), type = "response")) %>%
+      filter(date >= input$date_range[1] & date <= input$date_range[2]) %>%
+      mutate(probit_values = ifelse(is.na(lag(probit_values)), 0, lag(probit_values)))
+    
+    # Create a group column based on changes in the nber_rec column
+    data$group <- cumsum(data$nber_rec != lag(data$nber_rec, default = first(data$nber_rec)))
+    
+    data
   })
   
-  # Generate line plot
-  output$lineplot <- renderPlot({
-    ggplot(filtered_data(),  #if you don't want the date range option, you can replce `filtered_data` by `data`
-           aes_string(x = as.name(input$xvar), 
-                      y = as.name(input$yvar),
-                      group = 1)) +
-      geom_line() +
-      coord_cartesian(ylim = c(-1, 1)) +
-      theme_minimal()+
-      xlab('Year')
-  },
-  height = 400,
-  width = 400)
+  
+  
+  
+  output$line_plot <- renderPlotly({
+    p <- ggplot(filtered_data(), aes(date, probit_values, group = group)) +
+      geom_segment(aes(x = date, xend = lead(date), y = probit_values, yend = lead(probit_values), color = factor(nber_rec)), size = 1) +
+      scale_color_manual(values = c("black", "blue"), labels = c("Expansion", "Recession")) +
+      labs(color = "NBER Recession Indicator", x = "Date", y = "Probit Values")
+    ggplotly(p, tooltip = c("x", "y"))
+  })
+  
+  
+  
+  output$accuracy <- renderPrint({
+    # Subset the data based on the selected date range
+    subset_data <- filtered_data()
+    model <- glm(nber_rec ~ yield_curve, data = subset_data, family = binomial(link = "probit"))
+    (Probit.pred <- (fitted(model) > 0.5) %>% as.numeric %>% as.factor) # Prediction
+    (actual <- subset_data$nber_rec %>% as.factor) # actual data
+    # caret::confusionMatrix(Probit.pred, actual, positive = "1")
+    # Predict the recession indicator using the fitted model
+    #predicted_y_cap <- ifelse(fitted(model, newdata = subset_data, type = "response") > 0.5, 1, 0)
+    # Compute the confusion matrix and accuracy
+    confusion <- confusionMatrix(Probit.pred, actual, positive = "1")
+    paste0("Accuracy: ", confusion$overall["Accuracy"])
+  })
+  
 }
 
-# Run the app
-shinyApp(ui, server)
+
+# Run the Shiny app
+shinyApp(ui = ui, server = server)
