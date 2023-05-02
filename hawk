@@ -1,0 +1,79 @@
+library(shiny)
+library(ggplot2)
+library(fredr)
+library(dplyr)
+
+fredr_set_key('f31374c525421a4b2158ade45fea6a85')
+
+data <- fredr(series_id = "T10YFF", observation_start = as.Date("1962-01-01"), observation_end = as.Date("2023-03-01"), frequency = "m")
+
+# Get the NBER recession indicator data
+nber_data <- fredr(series_id = "USREC", observation_start = as.Date("1962-01-01"), observation_end = as.Date("2023-03-01"))
+
+# Merge the yield curve and NBER recession indicator data
+merged_data <- merge(data, nber_data, by = "date")
+names(merged_data)[3] <- "yield_curve"
+names(merged_data)[7] <- "nber_rec"
+
+merged_data$nber_rec <- as.factor(merged_data$nber_rec)
+
+ui <- fluidPage(
+  dateInput("start_date", "Start date", value = as.Date("1962-01-01"), min = as.Date("1962-01-01"), max = as.Date("2023-03-01")),
+  dateInput("end_date", "End date", value = as.Date("2023-03-01"), min = as.Date("1962-01-01"), max = as.Date("2023-03-01")),
+  plotOutput("yield_plot")
+)
+server <- function(input, output) {
+  
+  # Fit the probit model
+  probit_model <- glm(nber_rec ~ yield_curve, data = merged_data, family = binomial(link = "probit"))
+  
+  # Add probit values to merged_data
+  merged_data$probit_values <- predict(probit_model, merged_data, type = "response")
+  
+  # Create a grouping variable for consecutive observations with nber_rec == 1
+  merged_data$nber_group <- cumsum(c(0, diff(merged_data$nber_rec == "1") != 0))
+  
+  filtered_data <- reactive({
+    # Filter the data based on the selected dates
+    filter(merged_data, date >= input$start_date & date <= input$end_date)
+  })
+  
+  output$yield_plot <- renderPlot({
+    data <- filtered_data()
+    
+    # line graph
+    p <- ggplot(data, aes(date, probit_values)) +
+      geom_line(aes(color = nber_rec, group = 1), size = 1)
+    
+    cols <- c("0" = "black", "1" = "blue")
+    p <- p + scale_color_manual(values = cols)
+    
+    # create a data frame with x values for rectangles
+    rect_df <- data %>%
+      filter(nber_rec == "1") %>%
+      group_by(nber_group) %>%
+      summarize(xmin = min(date),
+                xmax = max(date),
+                ymin = -Inf,
+                ymax = Inf)
+    
+    # add rectangles to plot
+    p <- p + geom_rect(data = rect_df, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, group = nber_group), fill = "grey80", alpha = 0.5, color = NA, size = 0.1, inherit.aes = FALSE)
+    
+    # format x-axis with dates
+    years <- as.numeric(difftime(input$end_date, input$start_date, units = "weeks"))/52
+    if(years > 5){
+      p <- p + scale_x_date(date_labels = "%Y", date_breaks = "2 years")
+    }else{
+      p <- p + scale_x_date(date_labels = "%Y-%m-%d", date_breaks = "6 months")
+    }
+    
+    # return plot
+    p
+  })
+  
+}
+
+
+# Run the Shiny app
+shinyApp(ui = ui, server = server)
